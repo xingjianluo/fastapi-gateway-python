@@ -1,0 +1,24 @@
+health_check:
+  path: /healthz
+  interval_seconds: 1.0
+  timeout_seconds: 0.5
+
+routes:
+  - prefix: /api/echo
+    strip_prefix: true
+    request_timeout_seconds: 2.0
+    max_retries: 1
+    rate_limit:
+      rate_per_second: 50
+      burst: 100
+    circuit_breaker:
+      failure_threshold: 3
+      reset_timeout_seconds: 3.0
+      half_open_max_probes: 1
+    upstreams:
+      - name: echo-a
+        base_url: http://127.0.0.1:9001
+        max_in_flight: 32
+      - name: echo-b
+        base_url: http://127.0.0.1:9002
+        max_in_flight: 32
