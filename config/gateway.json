@@ -1,0 +1,32 @@
+{
+  "rate_limit": {
+    "rate_per_second": 5,
+    "burst": 10
+  },
+  "upstreams": {
+    "api": {
+      "instances": [
+        {"id": "api-1", "url": "http://127.0.0.1:9001"},
+        {"id": "api-2", "url": "http://127.0.0.1:9002"},
+        {"id": "api-3", "url": "http://127.0.0.1:9003"}
+      ],
+      "health_path": "/health",
+      "health_interval": 1.0,
+      "health_timeout": 1.0,
+      "max_inflight": 2,
+      "failure_threshold": 3,
+      "recover_threshold": 1,
+      "open_state_ttl": 2.0
+    }
+  },
+  "routes": [
+    {
+      "id": "api",
+      "prefix": "/api",
+      "upstream": "api",
+      "strip_prefix": true,
+      "timeout": 1.5,
+      "max_retries": 2
+    }
+  ]
+}
