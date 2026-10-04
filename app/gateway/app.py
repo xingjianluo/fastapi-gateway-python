@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse, Response
 
-from .breaker import CircuitBreaker
+from .admin import AdminController, build_single_pool, register_admin_routes
 from .config import GatewayConfig
 from .errors import RejectReason
 from .health import HealthTracker
@@ -21,7 +21,7 @@ from .logging_utils import (
     new_request_id,
     request_id_var,
 )
-from .pool import InflightLimit, Instance, UpstreamPool
+from .pool import UpstreamPool
 from .proxy import ProxyHandler, error_response
 from .ratelimit import ClientRateLimiter
 
@@ -29,37 +29,10 @@ logger = get_logger("app")
 
 
 def build_pools(config: GatewayConfig) -> dict[str, UpstreamPool]:
-    pools: dict[str, UpstreamPool] = {}
-    for up_id, up_cfg in config.upstreams.items():
-        instances: list[Instance] = []
-        for inst_cfg in up_cfg.instances:
-
-            def _on_change(name: str, old, new, now: float) -> None:
-                log_event(
-                    get_logger("breaker"),
-                    "breaker_state_changed",
-                    instance=name,
-                    old_state=old.value,
-                    new_state=new.value,
-                )
-
-            breaker = CircuitBreaker(
-                failure_threshold=up_cfg.failure_threshold,
-                recover_threshold=up_cfg.recover_threshold,
-                open_state_ttl=up_cfg.open_state_ttl,
-                name=inst_cfg.id,
-                on_state_change=_on_change,
-            )
-            instances.append(
-                Instance(
-                    id=inst_cfg.id,
-                    url=inst_cfg.url,
-                    breaker=breaker,
-                    inflight=InflightLimit(up_cfg.max_inflight),
-                )
-            )
-        pools[up_id] = UpstreamPool(up_id, instances)
-    return pools
+    return {
+        up_id: build_single_pool(up_id, up_cfg)
+        for up_id, up_cfg in config.upstreams.items()
+    }
 
 
 def create_app(
@@ -100,6 +73,17 @@ def create_app(
         )
 
     handler = ProxyHandler(config, pools, upstream_client, limiter)
+
+    admin_controller = AdminController(
+        config=config,
+        pools=pools,
+        health_tracker=health_tracker,
+        limiter=limiter,
+        handler=handler,
+    )
+    # 管理面必须在全捕获路由 /{path:path} 之前用 add_api_route 直接注册，
+    # 否则会被参数化兜底路由遮蔽（FastAPI 0.141 下 include_router 为懒解析）
+    register_admin_routes(app, admin_controller)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -163,4 +147,5 @@ def create_app(
     app.state.health_tracker = health_tracker
     app.state.pools = pools
     app.state.limiter = limiter
+    app.state.admin = admin_controller
     return app

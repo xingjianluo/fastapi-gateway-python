@@ -1,9 +1,10 @@
 # FastAPI 反向代理 / API 网关（本地可验证）
 
-一个纯 Python、零外部中间件的 API 网关实现：配置化路由前缀 + 多上游负载均衡、
+一个纯 Python、零外部中间件的 API 网关实现：配置化路由前缀 + 多上游**加权负载均衡**、
 后台健康探测、按客户端令牌桶限流（支持突发）、单上游在途并发限制、
-有界重试与故障切换、实例级熔断（closed/open/half_open）、逐跳头部剥离、
-统一错误响应与请求标识。所有能力均可在本机用内置模拟上游直接验证。
+有界重试与故障切换、实例级熔断（closed/open/half_open）、
+**实例摘除/重新纳入（在途请求跑完 + 恢复时预热渐进加流）、权重与配置热更新**、
+逐跳头部剥离、统一错误响应与请求标识。所有能力均可在本机用内置模拟上游直接验证。
 
 ## 目录结构
 
@@ -14,9 +15,10 @@ app/
     app.py             FastAPI 组装：生命周期、全捕获路由、stats、统一异常
     proxy.py           路由匹配、头部处理、转发、有界重试与故障切换
     ratelimit.py       按客户端的令牌桶（突发额度，并发不超发）
-    pool.py            实例选择/轮询、健康与熔断过滤、在途信号量
+    pool.py            平滑加权轮询(SWRR)、预热爬升、摘除/纳入、在途信号量
     breaker.py         单实例熔断器状态机 closed/open/half_open
-    health.py          后台周期性健康探测，驱动摘除与恢复收敛
+    health.py          后台周期性健康探测，驱动摘除与恢复收敛（支持热增删）
+    admin.py           管理面：热改权重、摘除/纳入、整份配置热加载
     errors.py          可区分的拒绝原因 -> 稳定状态码
     logging_utils.py   单行 JSON 结构化日志（含 request_id）
   upstreams/
@@ -55,15 +57,62 @@ curl -s http://127.0.0.1:8080/_gateway/stats          # 健康/在途/熔断快�
   端到端头部被保留。
 - 无匹配路由返回 `404`，错误体仍是统一结构。
 
-## 负载均衡、健康探测与故障切换
+## 加权负载均衡
 
-- 每个 upstream 组可有多个实例，选择采用**轮询**，逐请求推进起点。
+- 每个实例可配 `weight`（非负整数，默认 1），真实流量按**权重比例**分配。
+  选择算法是 nginx 式**平滑加权轮询（SWRR）**：每个实例维护一个动态权重
+  `current_weight`，每轮先加各自的有效权重，取最大者，再从被选者减去总有效权重。
+  - 权重 5:1:1 在 700 个请求上严格落到 500/100/100，无随机抖动；
+  - 整个选择过程在同一把锁内完成，并发压力下比例仍然成立；
+  - 低权重实例不会被饿死：只要 `weight > 0`，它在每个「权重和」窗口内必然被选中。
+- **`weight=0` 表示不再接新流量**，但实例仍留在池中并**继续参与健康检查**，
+  因此随时可以调回；调权通过管理面热生效，**无需重启**。
 - 候选实例必须同时满足：最近一次健康探测通过 **且** 熔断器允许
-  **且** 有空闲在途额度，任一不满足即跳过。
-- 健康探测为后台守护线程，周期性 GET `health_path`：
-  - 启动时先探测一轮，未通过的实例不接流量；
-  - 失败的实例立即摘除（`healthy=false`），不再接收新请求；
-  - 恢复后由探针驱动熔断器 `open -> half_open -> closed`，自动重新加入。
+  **且** 未被摘除 **且** 有效权重 > 0 **且** 有空闲在途额度。
+- 被权重选中的实例若在途额度已满，选择器会在**有界尝试次数（≤ 候选实例数）**内
+  换选其他实例：既不击穿该实例的在途上限，也不消耗客户端额外配额
+  （限流在选实例之前一次性判定）。
+
+## 健康探测
+
+健康探测为后台守护线程，周期性 GET `health_path`：
+
+- 启动时先探测一轮，未通过的实例不接流量；
+- 失败的实例立即标记 `healthy=false` 并从候选中摘除，不再接收新请求；
+- 权重为 0、正在摘除（draining）的实例**仍然被探测**，健康位保持新鲜；
+- 恢复后由探针驱动熔断器 `open -> half_open -> closed`，自动重新加入；
+- 探测目标支持热增删：热加载新增的实例会立即先探一轮，被移除的实例注销探测。
+
+## 实例摘除、重新纳入与预热爬升
+
+灰度发布/下线时把某个实例摘掉有三种等价入口：管理面 `drain`、把权重置 0、
+或在热加载配置里移除它。摘除语义统一为「**在途请求跑完，新请求不再进入**」：
+
+- 已经转发到该实例的请求不会被中途掐断，在 `finally` 中正常执行完毕、结果不错乱；
+  在途计数归零后实例标记为**已排空（drained）**。
+- 热加载中移除一个仍有在途请求的实例时，接口返回 **409**，先把它转为摘除状态，
+  等在途排空后再次 `reload` 才真正从运行时删除（杜绝带在途强删）。
+- 重新纳入（`resume`、权重 0→正数、故障恢复转健康）时，流量是**逐步加回**的：
+  有效权重在 `warmup_seconds` 窗口内从 `warmup_initial_ratio` **线性爬升**到配置权重，
+  避免刚恢复的实例被瞬间打垮。
+- 爬升在「不健康→健康」「weight 0→正数」「resume」时重置，因此
+  **反复注入故障再恢复的过程完全可重复**：实例不会出现「进去一次就再也回不来」。
+
+## 管理面（热更新，无需重启）
+
+| 方法与路径 | 作用 |
+| --- | --- |
+| `POST /_gateway/upstreams/{up}/instances/{id}/weight` | 热改权重，body `{"weight": 5}`；0 = 只摘流 |
+| `POST /_gateway/upstreams/{up}/instances/{id}/drain` | 摘除：新请求不进，在途跑完 |
+| `POST /_gateway/upstreams/{up}/instances/{id}/resume` | 重新纳入，从预热起点爬升 |
+| `GET  /_gateway/upstreams/{up}/instances/{id}/status` | 健康/权重/有效权重/摘除/在途/熔断快照 |
+| `POST /_gateway/reload` | 提交一份完整配置热加载（body 同 gateway.json） |
+
+`reload` 会协调实例增删（新增即登记探测、删除先等排空）、热改权重、
+热更熔断/预热/限流参数与路由；有待排空实例时返回 409 及待排空清单。
+
+## 故障切换与重试
+
 - 请求遇到连接错误 / 超时 / 上游 5xx 时**有界重试**：
   - 最多 `max_retries + 1` 次尝试（默认 2 次重试），绝不无限重试；
   - 重试优先选择本次**尚未尝试过**的实例；
@@ -79,8 +128,11 @@ curl -s http://127.0.0.1:8080/_gateway/stats          # 健康/在途/熔断快�
   - 空闲桶惰性过期。
 - 超限返回 **429**，带 `Retry-After: 1`。
 - 每个实例还有独立的**在途请求上限** `max_inflight`（有界信号量）：
-  额度占满时该实例被跳过；全部实例占满则立即返回 503，不排队堆积。
+  额度占满时该实例被加权选择器跳过并在有界次数内换选其他实例；
+  全部实例都占满（或权重为 0 / 摘除 / 熔断）则立即返回 503，不排队堆积。
   释放在 `finally` 中完成，客户端中途断开也会回收，杜绝计数泄漏。
+- 限流判定发生在选实例**之前**且每个请求只判定一次，因此「换实例重试」
+  既不会击穿客户端限流配额，也不会绕过单实例在途上限。
 
 ## 熔断策略（每实例独立状态机）
 
@@ -132,11 +184,14 @@ half_open ── 连续成功达到 recover_threshold ──▶ closed
 | `rate_limit` | `rate_per_second` | 每客户端稳态令牌速率 |
 | `rate_limit` | `burst` | 突发额度（桶容量） |
 | `upstreams.<id>` | `instances[].id/url` | 实例标识与基础 URL |
+| | `instances[].weight` | 流量权重（>=0，默认 1；0 = 不接新流量但仍探测） |
 | | `health_path` / `health_interval` / `health_timeout` | 探测路径/周期/超时 |
 | | `max_inflight` | 单实例在途请求上限 |
 | | `failure_threshold` | 触发熔断的连续失败数 |
 | | `recover_threshold` | 半开到关闭所需连续成功数 |
 | | `open_state_ttl` | open 持续时间，过后允许探测 |
+| | `warmup_seconds` | 重新纳入时有效权重线性爬升的时长（0=关闭预热） |
+| | `warmup_initial_ratio` | 爬升起点占配置权重的比例，取值 (0,1] |
 | `routes[]` | `prefix` / `upstream` | 匹配前缀与目标 upstream 组 |
 | | `strip_prefix` | 转发时是否剥离前缀 |
 | | `timeout` | 单次上游调用超时（秒） |
@@ -144,13 +199,15 @@ half_open ── 连续成功达到 recover_threshold ──▶ closed
 
 ## 观测
 
-- `GET /_gateway/stats`：各实例健康位、在途/上限、熔断器状态快照与限流参数。
+- `GET /_gateway/stats`：各实例健康位、配置权重、**预热有效权重**、摘除标记、
+  在途/上限、熔断器状态快照与限流参数。
 - 日志为单行 JSON，关键事件：
-  `route_selected`（路由决策）、`upstream_selected`（上游选择）、
+  `route_selected`（路由决策）、`upstream_selected`（上游选择，含 weight/有效权重）、
   `rate_limited`、`upstream_timeout`、`upstream_5xx`、
   `no_upstream`、`retries_exhausted`、
   `breaker_state_changed`（closed/open/half_open 迁移）、
-  `upstream_unhealthy` / `upstream_recovered`。
+  `upstream_unhealthy` / `upstream_recovered`、
+  `weight_updated` / `instance_draining` / `instance_resumed` / `config_reloaded`。
 
 ## 模拟上游的故障注入控制面
 
@@ -177,13 +234,46 @@ curl -s -w '\n%{http_code}\n' 'http://127.0.0.1:8080/api/slow?delay=3'
 curl -X POST http://127.0.0.1:9001/control/fail
 ```
 
+## 本地验证灰度流量（权重 / 摘除 / 预热回归）
+
+```bash
+# 前置：终端 A 启动 3 个上游，终端 B 启动网关（见“快速开始”）
+
+# 1) 看权重比例：把 api-3 权重调到 0（只摘流、仍探测），api-1 权重调到 5
+curl -s -X POST http://127.0.0.1:8080/_gateway/upstreams/api/instances/api-3/weight \
+  -H 'Content-Type: application/json' -d '{"weight": 0}'
+curl -s -X POST http://127.0.0.1:8080/_gateway/upstreams/api/instances/api-1/weight \
+  -H 'Content-Type: application/json' -d '{"weight": 5}'
+for i in $(seq 1 12); do
+  curl -s http://127.0.0.1:8080/api/echo | grep -o '"instance": "[^"]*"'
+done           # 只看到 api-1/api-2，比例约 5:1，api-3 完全不出现
+
+# 2) 摘除 api-2：在途请求跑完，新请求不再进入
+curl -s -X POST http://127.0.0.1:8080/_gateway/upstreams/api/instances/api-2/drain
+curl -s http://127.0.0.1:8080/_gateway/upstreams/api/instances/api-2/status
+#   -> {"healthy": true, "draining": true, "drained": true, "inflight": 0, ...}
+
+# 3) 重新纳入 api-2 / api-3：有效权重在 warmup_seconds 内逐步爬升
+curl -s -X POST http://127.0.0.1:8080/_gateway/upstreams/api/instances/api-2/resume
+curl -s -X POST http://127.0.0.1:8080/_gateway/upstreams/api/instances/api-3/weight \
+  -H 'Content-Type: application/json' -d '{"weight": 1}'
+curl -s http://127.0.0.1:8080/_gateway/stats   # 观察 effective_weight 逐步涨到满
+
+# 4) 反复故障/恢复：对 api-1 多次 fail/recover，流量每次都能平稳回到目标份额
+curl -X POST http://127.0.0.1:9001/control/fail
+sleep 2
+curl -X POST http://127.0.0.1:9001/control/recover
+# 配合 stats 中 healthy / breaker.state 观察 open -> half_open -> closed
+```
+
 ## 测试
 
 测试在进程内启动 3 个模拟上游与网关（线程中跑 uvicorn），无需外部进程：
 
 ```bash
-uv run pytest                      # 全部用例
-uv run pytest tests/test_units.py  # 令牌桶/熔断/在途信号量纯单测
+uv run pytest                          # 全部用例（结尾按场景打印覆盖与逐用例结果）
+uv run pytest tests/test_units.py -v   # 令牌桶/熔断/在途/SWRR/预热/摘除纯单测
+uv run pytest tests/test_weighted_release.py -v   # 灰度发布集成场景
 ```
 
 覆盖内容：
@@ -197,7 +287,18 @@ uv run pytest tests/test_units.py  # 令牌桶/熔断/在途信号量纯单测
 - **故障切换**：单实例 500 时 GET 在其他实例重试成功；全部 500 时
   重试次数有界（恰好 `max_retries+1`）并返回 502；全慢返回 504。
 - **熔断恢复**：故障后 `closed->open` 摘除流量，恢复后
-  `open->half_open->closed` 并重新参与轮询。
+  `open->half_open->closed` 并重新参与调度。
+- **权重分配**：等权与 5:1:1 / 4:3:2:1 等比例偏差为 0；并发 480 请求下
+  比例仍精确；低权重实例不被饿死；`weight=0` 摘流但仍探测；热改权重即时生效。
+- **摘除保护**：`drain` / 权重置 0 瞬间在途慢请求全部 200 跑完、新请求不进；
+  reload 移除有在途的实例返回 409，排空后再次 reload 才删除。
+- **反复故障恢复**：连续 3 轮 fail/recover（参数化）与多轮循环后，
+  三实例分布每次都平稳回到等权；实例不会「恢复一次就回不来」。
+- **预热渐进回归**：`resume`/恢复后 `effective_weight` 从初始比例线性爬满；
+  恢复早期份额低于稳态、窗口结束后回到稳态。
+- **协作**：权重最高实例在途打满时在有界次数内换实例；加权池下限流 429、
+  全权重 0 的 503、全慢的 504 状态码与 reason 保持不变。
 - **可区分性**：429 / 503 / 504 / 502 的状态码与 reason 字段稳定可区分。
-- **日志**：断言出现路由决策、上游选择与熔断器状态变化事件。
-  加 `-s` 可直接观察 JSON 日志。
+- **日志**：断言出现路由决策、上游选择（含权重）与熔断器状态变化事件。
+  结尾的「场景覆盖与逐用例结果」汇总可直接看到覆盖了哪些场景及每个用例结果；
+  加 `-s` 还可观察完整 JSON 日志。

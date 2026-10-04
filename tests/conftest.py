@@ -126,9 +126,17 @@ def make_config(
     open_state_ttl: float = 1.0,
     health_interval: float = 0.2,
     names: tuple[str, ...] = ("u1", "u2", "u3"),
+    weights: dict[str, int] | None = None,
+    warmup_seconds: float = 0.0,
+    warmup_initial_ratio: float = 0.1,
 ) -> GatewayConfig:
+    weights = weights or {}
     instances = tuple(
-        UpstreamInstanceConfig(id=n, url=f"http://127.0.0.1:{handles[n].port}")
+        UpstreamInstanceConfig(
+            id=n,
+            url=f"http://127.0.0.1:{handles[n].port}",
+            weight=weights.get(n, 1),
+        )
         for n in names
     )
     upstream = UpstreamConfig(
@@ -141,6 +149,8 @@ def make_config(
         failure_threshold=failure_threshold,
         recover_threshold=1,
         open_state_ttl=open_state_ttl,
+        warmup_seconds=warmup_seconds,
+        warmup_initial_ratio=warmup_initial_ratio,
     )
     route = RouteConfig(
         id="api",
@@ -184,3 +194,50 @@ def gateway(gateway_factory, upstream_calls):
     # 等待首轮健康探测完成
     time.sleep(0.3)
     return gw
+
+
+# --------------------------------------------------------------------- #
+# 场景化日志：按 SCENARIO 分组打印「覆盖了哪些场景、每个用例及结果」
+# --------------------------------------------------------------------- #
+
+def pytest_configure(config):
+    config._scenario_results = {}  # type: ignore[attr-defined]
+    config.addinivalue_line("markers", "scenario: 灰度能力场景分组")
+
+
+def _scenario_of(item) -> str:
+    cls = getattr(item, "cls", None)
+    scenario = getattr(cls, "SCENARIO", None)
+    if scenario:
+        return f"{cls.__name__}（{scenario}）"
+    if item.module.__name__.endswith("test_weighted_release"):
+        return f"{item.module.__name__}（灰度发布）"
+    return item.module.__name__
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call":
+        results = item.session.config._scenario_results  # type: ignore[attr-defined]
+        results.setdefault(_scenario_of(item), []).append(
+            (item.name, report.outcome)
+        )
+
+
+def pytest_terminal_summary(terminalreporter, config):
+    results = getattr(config, "_scenario_results", {})
+    if not results:
+        return
+    terminalreporter.write_sep("=", "场景覆盖与逐用例结果")
+    for scenario, cases in results.items():
+        passed = sum(1 for _, r in cases if r == "passed")
+        failed = sum(1 for _, r in cases if r == "failed")
+        terminalreporter.write_line(
+            f"\n▸ 场景: {scenario}  "
+            f"[共 {len(cases)} 个用例，通过 {passed}，失败 {failed}]"
+        )
+        for name, result in cases:
+            mark = "✓" if result == "passed" else "✗"
+            terminalreporter.write_line(f"    {mark} {name} -> {result}")

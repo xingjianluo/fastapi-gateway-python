@@ -214,6 +214,8 @@ class ProxyHandler:
                 instance=inst.id,
                 url=url,
                 attempt=route.max_retries - attempts_left + 1,
+                weight=inst.weight,
+                effective_weight=round(pool.effective_weight(inst), 4),
                 inflight=inst.inflight.active,
             )
 

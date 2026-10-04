@@ -78,6 +78,25 @@ class ClientRateLimiter:
             else:
                 self._buckets.pop(client, None)
 
+    def update_config(self, rate_per_second: float, burst: int) -> None:
+        """热更新限流参数（配置 reload）。
+
+        已存在的客户端桶保留：补充速率立即按新值计算；存量令牌超过新 burst
+        的部分会在下一次取令牌时被 min(burst, ...) 截断，不会超发。
+        """
+        if rate_per_second <= 0:
+            raise ValueError("rate_per_second 必须为正数")
+        if burst < 1:
+            raise ValueError("burst 必须 >= 1")
+        with self._lock:
+            self._rate = rate_per_second
+            self._burst = burst
+            # 已存在的桶：补充速率立即跟随新配置；存量令牌超额部分在下次
+            # try_acquire 时被 min(burst, ...) 截断
+            for bucket in self._buckets.values():
+                bucket.rate_per_second = rate_per_second
+                bucket.burst = burst
+
     def _evict_idle(self, now: float) -> None:
         """调用方需持有锁。"""
         stale = [
