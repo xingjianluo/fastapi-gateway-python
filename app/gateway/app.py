@@ -56,9 +56,12 @@ def build_pools(config: GatewayConfig) -> dict[str, UpstreamPool]:
                     url=inst_cfg.url,
                     breaker=breaker,
                     inflight=InflightLimit(up_cfg.max_inflight),
+                    weight=inst_cfg.weight,
                 )
             )
-        pools[up_id] = UpstreamPool(up_id, instances)
+        pools[up_id] = UpstreamPool(
+            up_id, instances, weight_warmup=up_cfg.weight_warmup
+        )
     return pools
 
 
@@ -140,6 +143,89 @@ def create_app(
                 },
             }
         )
+
+    # ------------------------------------------------------------------ #
+    # 灰度控制面：运行时调整权重 / 摘除 / 重新纳入（无需重启）
+    # ------------------------------------------------------------------ #
+
+    def _find_pool(upstream_id: str) -> UpstreamPool | None:
+        return pools.get(upstream_id)
+
+    def _instance_snapshot(pool: UpstreamPool, instance_id: str) -> dict:
+        for entry in pool.stats()["instances"]:
+            if entry["id"] == instance_id:
+                return entry
+        return {}
+
+    @app.post("/_gateway/upstreams/{upstream_id}/instances/{instance_id}/weight")
+    async def set_weight(upstream_id: str, instance_id: str,
+                         request: Request) -> JSONResponse:
+        pool = _find_pool(upstream_id)
+        if pool is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"未知 upstream: {upstream_id}"},
+            )
+        try:
+            payload = await request.json()
+            weight = int(payload["weight"])
+        except (ValueError, KeyError, TypeError):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "请求体必须为 JSON 且包含整数字段 weight"},
+            )
+        try:
+            found = pool.set_weight(instance_id, weight)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        if not found:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"未知实例: {instance_id}"},
+            )
+        log_event(
+            logger,
+            "weight_changed",
+            upstream=upstream_id,
+            instance=instance_id,
+            weight=weight,
+        )
+        return JSONResponse(_instance_snapshot(pool, instance_id))
+
+    @app.post("/_gateway/upstreams/{upstream_id}/instances/{instance_id}/remove")
+    async def remove_instance(upstream_id: str, instance_id: str) -> JSONResponse:
+        pool = _find_pool(upstream_id)
+        if pool is None or not pool.remove_instance(instance_id):
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"未知实例: {upstream_id}/{instance_id}"},
+            )
+        log_event(
+            logger,
+            "instance_removed",
+            upstream=upstream_id,
+            instance=instance_id,
+        )
+        return JSONResponse(_instance_snapshot(pool, instance_id))
+
+    @app.post(
+        "/_gateway/upstreams/{upstream_id}/instances/{instance_id}/reinclude"
+    )
+    async def reinclude_instance(upstream_id: str,
+                                 instance_id: str) -> JSONResponse:
+        pool = _find_pool(upstream_id)
+        if pool is None or not pool.reinclude_instance(instance_id):
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"未知实例: {upstream_id}/{instance_id}"},
+            )
+        log_event(
+            logger,
+            "instance_reincluded",
+            upstream=upstream_id,
+            instance=instance_id,
+        )
+        return JSONResponse(_instance_snapshot(pool, instance_id))
 
     @app.api_route(
         "/{path:path}",

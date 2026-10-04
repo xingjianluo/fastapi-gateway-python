@@ -6,9 +6,21 @@
   "upstreams": {
     "api": {
       "instances": [
-        {"id": "api-1", "url": "http://127.0.0.1:9001"},
-        {"id": "api-2", "url": "http://127.0.0.1:9002"},
-        {"id": "api-3", "url": "http://127.0.0.1:9003"}
+        {
+          "id": "api-1",
+          "url": "http://127.0.0.1:9001",
+          "weight": 1
+        },
+        {
+          "id": "api-2",
+          "url": "http://127.0.0.1:9002",
+          "weight": 1
+        },
+        {
+          "id": "api-3",
+          "url": "http://127.0.0.1:9003",
+          "weight": 1
+        }
       ],
       "health_path": "/health",
       "health_interval": 1.0,
@@ -16,7 +28,8 @@
       "max_inflight": 2,
       "failure_threshold": 3,
       "recover_threshold": 1,
-      "open_state_ttl": 2.0
+      "open_state_ttl": 2.0,
+      "weight_warmup": 10.0
     }
   },
   "routes": [

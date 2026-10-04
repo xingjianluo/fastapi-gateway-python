@@ -28,6 +28,40 @@ from app.upstreams.dummy import create_app as create_dummy
 configure_logging(logging.DEBUG)
 
 
+# --------------------------------------------------------------------- #
+# 场景化测试日志：每个用例执行后打印「场景说明 + 结果」，
+# 即使不加 -v 也能从输出看出覆盖了哪些场景。
+# --------------------------------------------------------------------- #
+
+_TERMINAL_REPORTER = None
+_TEST_DOCS: dict[str, str] = {}
+
+
+def pytest_collection_modifyitems(items) -> None:
+    global _TERMINAL_REPORTER
+    if items and _TERMINAL_REPORTER is None:
+        _TERMINAL_REPORTER = items[0].config.pluginmanager.get_plugin(
+            "terminalreporter"
+        )
+    for item in items:
+        doc = (getattr(item.obj, "__doc__", None) or "").strip().splitlines()
+        _TEST_DOCS[item.nodeid] = doc[0].strip() if doc else "(无场景说明)"
+
+
+def pytest_runtest_logreport(report) -> None:
+    if report.when != "call" or _TERMINAL_REPORTER is None:
+        return
+    outcome = {
+        "passed": "PASSED",
+        "failed": "FAILED",
+        "skipped": "SKIPPED",
+    }[report.outcome]
+    doc = _TEST_DOCS.get(report.nodeid, "")
+    _TERMINAL_REPORTER.write_line(
+        f"[场景] {report.nodeid} -> {outcome} | {doc}"
+    )
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -126,9 +160,16 @@ def make_config(
     open_state_ttl: float = 1.0,
     health_interval: float = 0.2,
     names: tuple[str, ...] = ("u1", "u2", "u3"),
+    weights: dict[str, int] | None = None,
+    weight_warmup: float = 0.0,
 ) -> GatewayConfig:
+    weights = weights or {}
     instances = tuple(
-        UpstreamInstanceConfig(id=n, url=f"http://127.0.0.1:{handles[n].port}")
+        UpstreamInstanceConfig(
+            id=n,
+            url=f"http://127.0.0.1:{handles[n].port}",
+            weight=weights.get(n, 1),
+        )
         for n in names
     )
     upstream = UpstreamConfig(
@@ -141,6 +182,7 @@ def make_config(
         failure_threshold=failure_threshold,
         recover_threshold=1,
         open_state_ttl=open_state_ttl,
+        weight_warmup=weight_warmup,
     )
     route = RouteConfig(
         id="api",

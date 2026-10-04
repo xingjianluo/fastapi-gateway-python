@@ -11,6 +11,8 @@ from pathlib import Path
 class UpstreamInstanceConfig:
     id: str
     url: str
+    # 静态权重：0 表示不接新流量（仍参与健康探测），缺省为 1
+    weight: int = 1
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,9 @@ class UpstreamConfig:
     failure_threshold: int = 3
     recover_threshold: int = 1
     open_state_ttl: float = 2.0
+    # 实例重新纳入（恢复健康/权重 0->正/重新加入）后的流量爬坡时长（秒）：
+    # 有效权重从接近 0 线性爬升到配置权重，避免刚恢复的实例被流量打垮
+    weight_warmup: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -102,11 +107,21 @@ def load_config(path: str | Path) -> GatewayConfig:
             UpstreamInstanceConfig(
                 id=str(inst["id"]),
                 url=str(inst["url"]).rstrip("/"),
+                weight=int(inst.get("weight", 1)),
             )
             for inst in inst_list
         )
         ids = [i.id for i in instances]
         _require(len(set(ids)) == len(ids), f"upstream {up_id} 实例 id 重复")
+        for inst in instances:
+            _require(
+                inst.weight >= 0,
+                f"upstream {up_id} 实例 {inst.id} weight 必须 >= 0",
+            )
+        _require(
+            any(i.weight > 0 for i in instances),
+            f"upstream {up_id} 至少需要一个 weight > 0 的实例",
+        )
         upstream = UpstreamConfig(
             id=up_id,
             instances=instances,
@@ -117,11 +132,13 @@ def load_config(path: str | Path) -> GatewayConfig:
             failure_threshold=int(up_raw.get("failure_threshold", 3)),
             recover_threshold=int(up_raw.get("recover_threshold", 1)),
             open_state_ttl=float(up_raw.get("open_state_ttl", 2.0)),
+            weight_warmup=float(up_raw.get("weight_warmup", 10.0)),
         )
         _require(upstream.max_inflight >= 1, f"upstream {up_id} max_inflight>=1")
         _require(upstream.failure_threshold >= 1, "failure_threshold>=1")
         _require(upstream.recover_threshold >= 1, "recover_threshold>=1")
         _require(upstream.open_state_ttl > 0, "open_state_ttl>0")
+        _require(upstream.weight_warmup >= 0, "weight_warmup>=0")
         upstreams[up_id] = upstream
 
     routes_list = []
